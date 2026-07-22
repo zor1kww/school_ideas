@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import asyncio
 import aiohttp
@@ -18,7 +19,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", 0))
 PORT = int(os.getenv("PORT", 8080))
-APP_URL = os.getenv("APP_URL") # Внешний URL на Render (например, https://my-bot.onrender.com)
+APP_URL = os.getenv("APP_URL")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,16 +34,8 @@ router = Router()
 class IdeaForm(StatesGroup):
     waiting_for_idea = State()
 
-class AdminReplyForm(StatesGroup):
-    waiting_for_reply_text = State()
-    target_user_id = State() # Временное хранение ID пользователя, которому мы отвечаем
-
-# CallbackData для удобной типизации данных в кнопках
 class SendTypeCallback(CallbackData, prefix="send_type"):
     is_anonymous: bool
-
-class ReplyCallback(CallbackData, prefix="reply"):
-    user_id: int
 
 # ==========================================
 # ЛОГИКА ПОЛЬЗОВАТЕЛЕЙ (ШКОЛЬНИКОВ)
@@ -58,10 +51,8 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(IdeaForm.waiting_for_idea, F.text)
 async def process_idea_text(message: Message, state: FSMContext):
-    # Сохраняем текст идеи в память (user_data)
     await state.update_data(idea_text=message.text)
     
-    # Формируем клавиатуру с выбором анонимности
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Анонимно 🥷", callback_data=SendTypeCallback(is_anonymous=True).pack()),
@@ -73,95 +64,98 @@ async def process_idea_text(message: Message, state: FSMContext):
         "Твоя идея принята! Как ты хочешь её отправить?",
         reply_markup=keyboard
     )
-    # Состояние не сбрасываем, ждем нажатия кнопки!
 
 @router.callback_query(SendTypeCallback.filter(), IdeaForm.waiting_for_idea)
 async def process_idea_send_type(callback: CallbackQuery, callback_data: SendTypeCallback, state: FSMContext):
-    # Достаем текст идеи из хранилища состояния
     data = await state.get_data()
     idea_text = data.get("idea_text")
     
-    # Формируем сообщение для модераторов
     if callback_data.is_anonymous:
+        topic_name = f"🥷 Анонимная идея"
         admin_text = f"🚨 <b>Новая АНОНИМНАЯ идея:</b>\n\n{idea_text}"
-        admin_keyboard = None
     else:
         user_name = callback.from_user.full_name
         username = f" (@{callback.from_user.username})" if callback.from_user.username else ""
         user_id = callback.from_user.id
         
-        admin_text = f"💡 <b>Новая идея от {user_name}{username} (ID: {user_id}):</b>\n\n{idea_text}"
-        # Кнопка для ответа автору
-        admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Ответить автору", callback_data=ReplyCallback(user_id=user_id).pack())]
-        ])
+        topic_name = f"💡 Идея от {user_name}"
+        admin_text = (
+            f"💡 <b>Новая идея от {user_name}{username}:</b>\n"
+            f"ID автора: <code>{user_id}</code>\n\n"
+            f"{idea_text}\n\n"
+            f"📌 <i>Чтобы ответить автору, просто пишите любые сообщения прямо в эту тему!</i>"
+        )
 
-    # Отправляем в группу модераторов
     try:
+        # 1. Создаем отдельную тему (топик) под эту идею
+        new_topic = await bot.create_forum_topic(
+            chat_id=ADMIN_GROUP_ID,
+            name=topic_name
+        )
+        
+        # 2. Публикуем текст идеи внутри созданной темы
         await bot.send_message(
-            chat_id=ADMIN_GROUP_ID, 
-            text=admin_text, 
-            reply_markup=admin_keyboard,
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=new_topic.message_thread_id,
+            text=admin_text,
             parse_mode="HTML"
         )
+        
         await callback.message.edit_text("Спасибо! Ваша идея успешно отправлена модераторам.")
     except Exception as e:
-        logging.error(f"Ошибка при отправке в админ-группу: {e}")
-        await callback.message.edit_text("Произошла ошибка при отправке. Пожалуйста, обратитесь к администратору.")
+        logging.error(f"Ошибка при создании темы в группе: {e}")
+        await callback.message.edit_text("Произошла ошибка при отправке. Убедитесь, что в группе включены темы (форум).")
 
-    await state.clear() # Очищаем данные отправителя
-
-# ==========================================
-# ЛОГИКА МОДЕРАТОРОВ (АДМИНОВ)
-# ==========================================
-
-@router.callback_query(ReplyCallback.filter())
-async def process_admin_reply_button(callback: CallbackQuery, callback_data: ReplyCallback, state: FSMContext):
-    # Проверяем, что кнопка нажата в группе (необязательно, но полезно)
-    if callback.message.chat.id != ADMIN_GROUP_ID:
-        return await callback.answer("Эту кнопку можно нажимать только в чате модераторов.")
-
-    user_id_to_reply = callback_data.user_id
-    
-    # Записываем, кому именно мы будем отвечать
-    await state.update_data(target_user_id=user_id_to_reply)
-    await state.set_state(AdminReplyForm.waiting_for_reply_text)
-    
-    await callback.message.reply(
-        "Напишите текст ответа. Следующее ваше сообщение будет переслано автору идеи."
-    )
-    await callback.answer()
-
-@router.message(AdminReplyForm.waiting_for_reply_text, F.text)
-async def process_admin_reply_text(message: Message, state: FSMContext):
-    # Достаем ID школьника, которому нужно ответить
-    data = await state.get_data()
-    target_user_id = data.get("target_user_id")
-    
-    try:
-        # Отправляем сообщение школьнику
-        await bot.send_message(
-            chat_id=target_user_id,
-            text=f"✉️ <b>Ответ от модератора на вашу идею:</b>\n\n{message.text}",
-            parse_mode="HTML"
-        )
-        await message.reply("✅ Ответ успешно доставлен автору!")
-    except Exception as e:
-        logging.error(f"Не удалось отправить ответ пользователю {target_user_id}: {e}")
-        await message.reply("❌ Ошибка отправки! Возможно, пользователь заблокировал бота.")
-    
     await state.clear()
+
+# ==========================================
+# ЛОГИКА МОДЕРАТОРОВ (ОТВЕТ ИЗ ТЕМЫ)
+# ==========================================
+
+@router.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id)
+async def reply_from_topic(message: Message):
+    """Ловит сообщения админов в теме и пересылает их ученику."""
+    # Игнорируем служебные сообщения (создание темы и т.д.)
+    if not message.text:
+        return
+
+    try:
+        # Получаем самое первое сообщение в теме (где указан ID пользователя)
+        # Так как первое сообщение отправляет сам бот, берем message_id = message.message_thread_id
+        first_msg = await bot.forward_message(
+            chat_id=ADMIN_GROUP_ID,
+            from_chat_id=ADMIN_GROUP_ID,
+            message_id=message.message_thread_id
+        )
+        # Удаляем пересланную копию, она нужна была только для чтения
+        await bot.delete_message(chat_id=ADMIN_GROUP_ID, message_id=first_msg.message_id)
+
+        # Ищем ID автора через регулярное выражение в тексте первого сообщения
+        match = re.search(r"ID автора: <code>(\d+)</code>", first_msg.text or "")
+        
+        if match:
+            target_user_id = int(match.group(1))
+            # Пересылаем ответ школьнику
+            await bot.send_message(
+                chat_id=target_user_id,
+                text=f"✉️ <b>Ответ от модератора:</b>\n\n{message.text}",
+                parse_mode="HTML"
+            )
+            await message.react([{"type": "emoji", "emoji": "👍"}])  # Ставим реакцию-галочку в чате
+        else:
+            # Если ID не найден — значит идея была АНОНИМНОЙ
+            logging.info("Сообщение написано в анонимной теме, пересылка не требуется.")
+    except Exception as e:
+        logging.error(f"Ошибка при пересылке ответа из темы: {e}")
 
 # ==========================================
 # WEB СЕРВЕР & KEEP-ALIVE ДЛЯ RENDER.COM
 # ==========================================
 
 async def web_health_handler(request):
-    """Простой эндпоинт, чтобы Render понимал, что сервис жив."""
     return web.Response(text="Bot is running! (OK)", status=200)
 
 async def start_web_server():
-    """Запускает aiohttp web-сервер в фоне."""
     app = web.Application()
     app.router.add_get('/', web_health_handler)
     app.router.add_get('/health', web_health_handler)
@@ -173,25 +167,17 @@ async def start_web_server():
     logging.info(f"Веб-сервер запущен на порту {PORT}")
 
 async def keep_alive_task():
-    """
-    Раз в 5 минут отправляет GET-запрос на свой же URL.
-    Это имитирует внешнюю активность и не дает Render усыпить бота.
-    ВАЖНО: Должен использоваться внешний URL (https://...), а не localhost!
-    """
     if not APP_URL:
-        logging.warning("APP_URL не задан в .env. Keep-Alive пинг не будет работать корректно на Render.")
+        logging.warning("APP_URL не задан в .env. Keep-Alive пинг не будет работать.")
         return
 
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # Пингуем сами себя
                 async with session.get(APP_URL) as response:
                     logging.info(f"Keep-Alive пинг: статус {response.status}")
             except Exception as e:
                 logging.error(f"Ошибка Keep-Alive пинга: {e}")
-            
-            # Ждем 5 минут (300 секунд) перед следующим пингом
             await asyncio.sleep(300)
 
 # ==========================================
@@ -200,16 +186,10 @@ async def keep_alive_task():
 
 async def main():
     dp.include_router(router)
-    
-    # Запускаем фоновый веб-сервер
     await start_web_server()
-    
-    # Запускаем фоновую задачу для Keep-Alive
     asyncio.create_task(keep_alive_task())
-    
-    # Удаляем старые вебхуки (на случай, если они были) и запускаем поллинг
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот начал поллинг (успешный запуск)")
+    logging.info("Бот начал поллинг")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
@@ -217,4 +197,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logging.info("Бот остановлен.")
-        
