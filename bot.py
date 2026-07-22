@@ -71,7 +71,7 @@ async def process_idea_send_type(callback: CallbackQuery, callback_data: SendTyp
     idea_text = data.get("idea_text")
     
     if callback_data.is_anonymous:
-        topic_name = f"🥷 Анонимная идея"
+        topic_name = "🥷 Анонимная идея"
         admin_text = f"🚨 <b>Новая АНОНИМНАЯ идея:</b>\n\n{idea_text}"
     else:
         user_name = callback.from_user.full_name
@@ -115,36 +115,37 @@ async def process_idea_send_type(callback: CallbackQuery, callback_data: SendTyp
 @router.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id)
 async def reply_from_topic(message: Message):
     """Ловит сообщения админов в теме и пересылает их ученику."""
-    # Игнорируем служебные сообщения (создание темы и т.д.)
-    if not message.text:
+    # Игнорируем служебные сообщения и сообщения от самого бота
+    if not message.text or message.from_user.is_bot:
         return
 
     try:
-        # Получаем самое первое сообщение в теме (где указан ID пользователя)
-        # Так как первое сообщение отправляет сам бот, берем message_id = message.message_thread_id
+        # Получаем первое сообщение в теме (где указан ID автора)
         first_msg = await bot.forward_message(
             chat_id=ADMIN_GROUP_ID,
             from_chat_id=ADMIN_GROUP_ID,
             message_id=message.message_thread_id
         )
-        # Удаляем пересланную копию, она нужна была только для чтения
+        msg_text = first_msg.text or ""
         await bot.delete_message(chat_id=ADMIN_GROUP_ID, message_id=first_msg.message_id)
 
-        # Ищем ID автора через регулярное выражение в тексте первого сообщения
-        match = re.search(r"ID автора: <code>(\d+)</code>", first_msg.text or "")
+        # Ищем ID пользователя через регулярное выражение
+        match = re.search(r"ID автора:\s*<code>(\d+)</code>", msg_text) or re.search(r"<code>(\d+)</code>", msg_text)
         
         if match:
             target_user_id = int(match.group(1))
-            # Пересылаем ответ школьнику
+            
+            # Отправляем ответ ученику
             await bot.send_message(
                 chat_id=target_user_id,
-                text=f"✉️ <b>Ответ от модератора:</b>\n\n{message.text}",
+                text=f"✉️ <b>Ответ от администрации школы:</b>\n\n{message.text}",
                 parse_mode="HTML"
             )
-            await message.react([{"type": "emoji", "emoji": "👍"}])  # Ставим реакцию-галочку в чате
+            # Подтверждаем отправку реакцией 👍
+            await message.react([{"type": "emoji", "emoji": "👍"}])
         else:
-            # Если ID не найден — значит идея была АНОНИМНОЙ
-            logging.info("Сообщение написано в анонимной теме, пересылка не требуется.")
+            logging.info("Ответ написан в анонимной теме — пересылка не требуется.")
+
     except Exception as e:
         logging.error(f"Ошибка при пересылке ответа из темы: {e}")
 
